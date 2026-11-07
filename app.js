@@ -15,11 +15,41 @@
   const activeMonth = MONTHS[now.getMonth()];
   const activeYear = now.getFullYear();
   let modalMode = '';
+  const supabaseConfig = window.CRM_SUPABASE_CONFIG || {};
+  const cloudClient = window.supabase && supabaseConfig.url && supabaseConfig.anonKey && !supabaseConfig.url.includes('YOUR_')
+    ? window.supabase.createClient(supabaseConfig.url, supabaseConfig.anonKey) : null;
+  let cloudUserId = null, cloudSaveTimer = 0;
+  const cloudReady = () => !!cloudClient;
 
   function accountKey(email) { return `${KEY}:${String(email).toLowerCase()}`; }
   function loadWorkspace(email) { try { return { ...emptyState, ...JSON.parse(localStorage.getItem(accountKey(email)) || '{}') }; } catch { return { ...emptyState }; } }
   function migrateLegacyWorkspace(email) { if(localStorage.getItem(accountKey(email))||!localStorage.getItem(KEY))return;try{localStorage.setItem(accountKey(email),JSON.stringify({...emptyState,...JSON.parse(localStorage.getItem(KEY))}));}catch{}}
-  function save() { if (!activeAccount) return; localStorage.setItem(accountKey(activeAccount.email), JSON.stringify(db)); renderAll(); }
+  function save() {
+    if (!activeAccount) return;
+    localStorage.setItem(accountKey(activeAccount.email), JSON.stringify(db)); renderAll();
+    if (cloudUserId) {
+      clearTimeout(cloudSaveTimer); cloudSaveTimer=setTimeout(async()=>{
+        const {error}=await cloudClient.from('crm_workspaces').upsert({user_id:cloudUserId,data:db,updated_at:new Date().toISOString()},{onConflict:'user_id'});
+        if(error) toast('Cloud sync failed; this browser still has your saved changes.');
+      },700);
+    }
+  }
+  async function loadCloudWorkspace(user) {
+    cloudUserId=user.id;
+    const {data,error}=await cloudClient.from('crm_workspaces').select('data').eq('user_id',user.id).maybeSingle();
+    if(error) throw error;
+    const local=loadWorkspace(user.email);
+    if(data?.data) db={...emptyState,...data.data};
+    else {
+      const hasLocal=local.companies.length||local.payroll.length||local.invoices.length;
+      if(hasLocal && window.confirm('This Supabase account has no saved CRM workspace. Upload this browser’s company details, employee PINs, payroll, VAT invoices, and activity to your account so you can use them on other devices?')) {
+        db=local;
+        const {error:writeError}=await cloudClient.from('crm_workspaces').upsert({user_id:user.id,data:db,updated_at:new Date().toISOString()},{onConflict:'user_id'});
+        if(writeError) throw writeError;
+      } else db={...emptyState};
+    }
+    localStorage.setItem(accountKey(user.email),JSON.stringify(db));
+  }
   function addActivity(message, kind = 'record') {
     db.activities.unshift({ id: crypto.randomUUID(), message, kind, at: new Date().toISOString() });
     db.activities = db.activities.slice(0, 8);
@@ -136,17 +166,46 @@
     const companyId=$('#p9-company').value, year=Number($('#p9-year').value||activeYear), employeeSelect=$('#p9-employee');
     const names=new Map(); db.payroll.filter(r=>r.companyId===companyId&&Number(r.year)===year).forEach(r=>names.set(r.pin||r.name,{name:r.name,pin:r.pin}));
     const old=employeeSelect.value; employeeSelect.innerHTML=[...names].map(([id,v])=>`<option value="${esc(id)}">${esc(v.name)}</option>`).join('');
-    if([...employeeSelect.options].some(o=>o.value===old)) employeeSelect.value=old;
+    if([...employeeSelect.options].some(o=>o.value===old)) employeeSelect.value=old;else if(employeeSelect.options.length)employeeSelect.selectedIndex=0;
     const key=employeeSelect.value, rec=db.payroll.filter(r=>r.companyId===companyId&&Number(r.year)===year&&(r.pin||r.name)===key);
-    const selected=rec[0], company=db.companies.find(c=>c.id===companyId);
-    $('#p9-tax-year').textContent=`Tax year ${year}`; $('#p9-employer').textContent=company?.name||'Select a company'; $('#p9-company-pin').textContent=company?.pin||'—';
-    $('#p9-person').textContent=selected?.name||'Select an employee'; $('#p9-person-pin').textContent=selected?.pin||'—';
-    $('#p9-rule-chip').textContent=selected?`PAYE rules effective ${selected.rules?.paye||'—'}`:'Effective rules by month';
-    const months=MONTHS.map(m=>{const rows=rec.filter(r=>r.month===m);return {month:m,gross:rows.reduce((a,r)=>a+Number(r.gross||0),0),nssf:rows.reduce((a,r)=>a+Number(r.nssf||0),0),shif:rows.reduce((a,r)=>a+Number(r.shif||0),0),ahl:rows.reduce((a,r)=>a+Number(r.ahl||0),0),taxable:rows.reduce((a,r)=>a+Number(r.taxable||0),0),paye:rows.reduce((a,r)=>a+Number(r.paye||0),0)}});
-    $('#p9-rows').innerHTML=months.map(r=>`<tr><td>${r.month}</td><td>${money(r.gross)}</td><td>${money(r.nssf)}</td><td>${money(r.shif)}</td><td>${money(r.ahl)}</td><td>${money(r.taxable)}</td><td>${money(r.paye)}</td></tr>`).join('');
-    const totals=['gross','nssf','shif','ahl','taxable','paye'].map(k=>months.reduce((a,r)=>a+r[k],0));
-    $('#p9-total').innerHTML=`<tr><th>TOTAL</th>${totals.map(v=>`<th>${money(v)}</th>`).join('')}</tr>`;
-    $('#p9-gross-total').textContent=money(totals[0]); $('#p9-nssf-total').textContent=money(totals[1]); $('#p9-shif-total').textContent=money(totals[2]); $('#p9-ahl-total').textContent=money(totals[3]); $('#p9-paye-total').textContent=money(totals[5]);
+    const employee=names.get(key),company=db.companies.find(c=>c.id===companyId),model=p9Model(company,year,employee,rec);
+    $('#p9-document').innerHTML=model?p9CardMarkup(model):'<div class="p9-empty"><strong>No payroll records for this company and year</strong><p>Add or import the employee payroll before preparing a P9 card.</p></div>';
+    $('#p9-rule-chip').textContent=model?`Effective-dated PAYE schedules · ${model.months.filter(m=>m.gross).length} payroll months`:'Workbook-style P9A · effective rules by month';
+    $('#p9-gross-total').textContent=money(model?.total.gross||0);$('#p9-chargeable-total').textContent=money(model?.total.chargeable||0);$('#p9-tax-total').textContent=money(model?.total.taxCharged||0);$('#p9-deductions-total').textContent=money(model?.total.deductions||0);$('#p9-paye-total').textContent=money(model?.total.paye||0);
+    $('#print-p9').disabled=!model;$('#print-all-p9').disabled=!names.size;
+  }
+  function p9Model(company,year,employee,records) {
+    if(!employee||!records.length)return null;
+    const sum=(rows,key)=>rows.reduce((a,r)=>a+Number(r[key]||0),0);
+    const fieldSum=(rows,source,fallback)=>rows.reduce((a,r)=>a+Number(r[source]??r[fallback]??0),0);
+    const months=MONTHS.map(month=>{const rows=records.filter(r=>r.month===month);const gross=sum(rows,'gross'),nssf=sum(rows,'nssf'),ahl=sum(rows,'ahl'),shif=sum(rows,'shif'),prmf=sum(rows,'prmfDeduction'),interest=sum(rows,'mortgageDeduction');const pension30=gross*.30,fixedLimit=gross?30000:0,pension=Math.min(pension30,nssf,fixedLimit);return {month,basic:rows.reduce((a,r)=>a+Number(r.cash??Math.max(0,Number(r.gross||0)-Number(r.nonCash||0)-Number(r.meals||0))),0),nonCash:sum(rows,'nonCash'),meals:sum(rows,'meals'),gross,pension30,nssf,fixedLimit,ahl,shif,prmf,interest,deductions:pension+ahl+shif+prmf+interest,chargeable:fieldSum(rows,'importedTaxable','taxable'),taxCharged:fieldSum(rows,'importedTaxCharged','grossTax'),personalRelief:fieldSum(rows,'importedRelief','personalRelief'),insuranceRelief:sum(rows,'insuranceRelief'),paye:sum(rows,'paye'),ruleDates:[...new Set(rows.map(r=>r.rules?.paye).filter(Boolean))]};});
+    const keys=['basic','nonCash','meals','gross','pension30','nssf','fixedLimit','ahl','shif','prmf','interest','deductions','chargeable','taxCharged','personalRelief','insuranceRelief','paye'];
+    const total=Object.fromEntries(keys.map(k=>[k,sum(months,k)]));
+    return {company,year,employee,months,total};
+  }
+  function p9Number(value) {return Number(value||0).toLocaleString('en-KE',{minimumFractionDigits:0,maximumFractionDigits:2});}
+  function p9CardMarkup(model) {
+    const m=model.months,t=model.total;
+    const row=(values, label=false)=>`<tr>${values.map((v,i)=>i===0?`<th>${esc(v)}</th>`:`<td>${label?esc(v):p9Number(v)}</td>`).join('')}</tr>`;
+    const monthly=m.map(x=>row([x.month,x.basic,x.nonCash,x.meals,x.gross,x.pension30,x.nssf,x.fixedLimit,x.ahl,x.shif,x.prmf,x.interest,x.deductions,x.chargeable,x.taxCharged,x.personalRelief,x.insuranceRelief,x.paye])).join('');
+    const letters=['','A-','B-','C-','D-','E1 30%','E2 NSSF Actual','E3 Fixed Limit','F Amount','G Amount','H Amount','J Amount','K Total Kshs','L','', '', '', ''];
+    const subheads=['','','','','','','','','','','','','','','','','',''];
+    return `<div class="p9-topline"><span>P9A</span><div class="kra-heading"><div class="kra-mark" aria-hidden="true">KRA</div><div><strong>KENYA REVENUE<br>AUTHORITY</strong><small>TAX DEDUCTION CARD YEAR ${model.year}</small></div></div><span></span></div>
+      <div class="p9-identity p9-identity-exact"><div><span>Employer's Name............</span><strong>${esc(model.company?.name||'')}</strong></div><div><span>Employer's PIN</span><strong>${esc(model.company?.pin||'')}</strong></div><div><span>Employee's Main Name:</span><strong>${esc(model.employee?.mainName||model.employee?.name||'')}</strong></div><div><span>Employee's PIN</span><strong>${esc(model.employee?.pin||'')}</strong></div><div><span>Employee's Other Name:</span><strong>${esc(model.employee?.otherName||'')}</strong></div><div></div></div>
+      <div class="table-wrap p9-table-wrap"><table class="p9-table"><thead><tr><th rowspan="2">MONTH</th><th rowspan="2">Basic Salary</th><th rowspan="2">Benefits-<br>Non-Cash</th><th rowspan="2">Value of<br>Meals</th><th rowspan="2">Total Gross<br>Pay</th><th colspan="3">Defined Contribution Retirement Scheme / NSSF</th><th rowspan="2">Affordable Housing<br>Levy (AHL)</th><th rowspan="2">Social Health<br>Insurance Fund (SHIF)</th><th rowspan="2">Post Retirement<br>Medical Fund (PRMF)</th><th rowspan="2">Owner-Occupied<br>Interest</th><th rowspan="2">Total<br>Deductions</th><th rowspan="2">Chargeable<br>Pay</th><th rowspan="2">Tax<br>Charged</th><th rowspan="2">Personal<br>Relief</th><th rowspan="2">Insurance<br>Relief</th><th rowspan="2">PAYE Tax</th></tr><tr><th>E1 30%<br>of Gross</th><th>E2 NSSF<br>Actual</th><th>E3 Fixed<br>Limit</th></tr></thead><tbody>${monthly}</tbody><tfoot>${row(['TOTAL',t.basic,t.nonCash,t.meals,t.gross,t.pension30,t.nssf,t.fixedLimit,t.ahl,t.shif,t.prmf,t.interest,t.deductions,t.chargeable,t.taxCharged,t.personalRelief,t.insuranceRelief,t.paye])}</tfoot></table></div>
+      <div class="p9-year-end"><div><strong>To be completed by Employer at end of year</strong><b>TOTAL CHARGEABLE PAY (COL. O) &nbsp; ${p9Number(t.chargeable)}</b></div><div><strong>TOTAL TAX (COL. S) Kshs. &nbsp; ${p9Number(t.paye)}</strong></div></div>
+      <div class="p9-legal"><div><strong>IMPORTANT</strong><p><b>1. Use P9A</b><br>(a) For all liable employees<br>(b) Where an employee is eligible to tax relief<br>(c) Allowable interest is subject to the applicable limit.</p><small>(See back of this card for further information)</small></div><div><p>(b) Attach photocopy of interest certificate and statement of account from the Financial Institution.</p><strong>(ii) THE DECLARATION</strong><p>Names of Financial Institution: ${esc(model.employee?.financialInstitution||'N/A')}</p><p>L.R. No. of owner occupied property: ${esc(model.employee?.propertyNumber||'N/A')}</p><p>Date of occupation: ${esc(model.employee?.occupationDate||'N/A')}</p></div></div>`;
+  }
+  function p9BatchModels() {
+    const companyId=$('#p9-company').value,year=Number($('#p9-year').value||activeYear),keys=new Map();
+    db.payroll.filter(r=>r.companyId===companyId&&Number(r.year)===year).forEach(r=>keys.set(r.pin||r.name,{name:r.name,pin:r.pin}));
+    const company=db.companies.find(c=>c.id===companyId);
+    return [...keys].map(([key,employee])=>p9Model(company,year,employee,db.payroll.filter(r=>r.companyId===companyId&&Number(r.year)===year&&(r.pin||r.name)===key))).filter(Boolean);
+  }
+  function printAllP9() {
+    const models=p9BatchModels();if(!models.length){toast('No employees have payroll records for this company and tax year.');return;}
+    const host=document.createElement('div');host.id='p9-batch-print';host.innerHTML=models.map((m,i)=>`<article class="p9-document p9-print-page" data-employee="${esc(m.employee?.name||'')}">${p9CardMarkup(m)}</article>`).join('');document.body.append(host);document.body.classList.add('printing-p9-batch');
+    const cleanup=()=>{host.remove();document.body.classList.remove('printing-p9-batch');window.removeEventListener('afterprint',cleanup);};window.addEventListener('afterprint',cleanup,{once:true});window.print();setTimeout(cleanup,60000);
   }
   function renderAll() {
     companyOptions($('#payroll-company'), $('#payroll-company')?.value);
@@ -180,7 +239,7 @@
     $('#auth-name-wrap').hidden=!signup; $('#auth-confirm-wrap').hidden=!signup; $('#auth-options').hidden=signup;
     $('#auth-eyebrow').textContent=signup?'GET STARTED':'WELCOME BACK';
     $('#auth-title').textContent=signup?'Create your CRM account':'Sign in to CRM';
-    $('#auth-description').textContent=signup?'Create a private workspace on this browser.':'Use your local workspace account to continue.';
+    $('#auth-description').textContent=cloudReady()?'Create or access your CRM workspace across devices.':signup?'Create a private workspace on this browser.':'Use your local workspace account to continue.';
     $('#auth-submit').innerHTML=signup?'Create account <span>→</span>':'Sign in <span>→</span>';
     $('#auth-password').autocomplete=signup?'new-password':'current-password';
     $$('.auth-tab').forEach(b=>b.classList.toggle('active',b.dataset.authMode===mode));
@@ -194,6 +253,14 @@
     $('#auth-page').hidden=true; $('#app-shell').hidden=false;
     showView(location.hash.slice(1)||'overview'); renderAll(); renderTaxNews();
   }
+  function showCloudWorkspace(user) {
+    const name=user.user_metadata?.full_name||user.email.split('@')[0];
+    activeAccount={email:user.email,name};
+    $('#profile-name').textContent=name; $('#profile-email').textContent=user.email;
+    $('#profile-avatar').textContent=name.split(/\s+/).map(x=>x[0]).slice(0,2).join('').toUpperCase();
+    $('#auth-page').hidden=true; $('#app-shell').hidden=false;
+    showView(location.hash.slice(1)||'overview'); renderAll(); renderTaxNews();
+  }
   function bytesToBase64(bytes) { let binary=''; bytes.forEach(b=>binary+=String.fromCharCode(b)); return btoa(binary); }
   function base64ToBytes(value) { return Uint8Array.from(atob(value),c=>c.charCodeAt(0)); }
   async function passwordHash(password,salt) {
@@ -202,6 +269,14 @@
     return bytesToBase64(new Uint8Array(bits));
   }
   function initAuth() {
+    const note=$('#auth-storage-note');
+    if(cloudReady()) note.innerHTML='<strong>Supabase cloud workspace</strong><br>Sign in on another device to load your saved workspace. Existing local records require your confirmation before upload.';
+    else note.innerHTML='<strong>Browser-only account</strong><br>Cloud sign-in is not connected yet. Records remain on this device until Supabase is configured.';
+    if(cloudReady()) { cloudClient.auth.getSession().then(async({data,error})=>{
+      if(error||!data.session)return;
+      try{await loadCloudWorkspace(data.session.user);showCloudWorkspace(data.session.user);}
+      catch(e){cloudUserId=null;$('#auth-error').textContent=`Could not load the cloud workspace: ${e.message}`;openAuth();}
+    }); return; }
     const email=sessionStorage.getItem(SESSION_KEY)||localStorage.getItem(SESSION_KEY);
     const account=accounts().find(a=>a.email===email);
     if(account) showWorkspace(account); else { sessionStorage.removeItem(SESSION_KEY); localStorage.removeItem(SESSION_KEY); openAuth(); }
@@ -272,6 +347,10 @@
   }
   function parseInvoiceDate(value) {
     const raw=String(value||'').trim();
+    const serial=Number(raw);
+    if(/^\d{5}(?:\.\d+)?$/.test(raw) && serial>10000 && serial<100000) return new Date(Date.UTC(1899,11,30)+Math.floor(serial)*86400000);
+    const iso=raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+    if(iso) return new Date(Number(iso[1]),Number(iso[2])-1,Number(iso[3]));
     const dmy=raw.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})$/);
     if(dmy) return new Date(Number(dmy[3]),Number(dmy[2])-1,Number(dmy[1]));
     const parsed=new Date(raw);
@@ -280,30 +359,52 @@
   async function importPayroll(file) {
     if(!db.companies.length){toast('Add a company before importing payroll.');showView('companies');return;}
     const rows=parseCsv(await file.text()); if(!rows.length){toast('The selected file is empty.');return;}
-    const headers=rows[0].map(x=>x.toLowerCase()); const hasHeaders=headers.some(x=>x.includes('pin')||x.includes('employee')||x.includes('cash pay'));
-    const body=hasHeaders?rows.slice(1):rows; const idx=(words,fallback)=>{const i=headers.findIndex(h=>words.some(w=>h.includes(w)));return i>=0?i:fallback;};
-    const cols={pin:idx(['pin of employee','employee pin'],0),name:idx(['name of the employee','employee name'],1),residential:idx(['residential status'],2),cash:idx(['total cash pay','cash pay'],4),nonCash:idx(['total non cash pay','non cash pay'],5),meals:idx(['value of meals'],6),housing:idx(['net value of housing'],7),gross:idx(['total gross pay'],8),benefit:idx(['amount of benefit'],9),taxable:idx(['taxable pay'],10),taxPayable:idx(['tax payable'],11),paye:idx(['paye tax'],12),selfAssessed:idx(['self assessed paye'],13)};
-    const companyId=$('#payroll-company').value||db.companies[0].id, month=$('#payroll-month').value||activeMonth, year=Number($('#payroll-year').value||activeYear);let count=0;
-    const hasSelfAssessedColumn=hasHeaders?headers.some(h=>h.includes('self assessed paye')):body[0]?.length>=14;
-    for(const cells of body){if(!cells[cols.name]?.trim())continue;const n=i=>Number(String(cells[i]||'').replace(/[, ]/g,''))||0;const sourcePAYE=n(hasSelfAssessedColumn?cols.selfAssessed:cols.paye);
-      const raw={companyId,month,year,pin:(cells[cols.pin]||'').trim(),name:(cells[cols.name]||'').trim(),residential:(cells[cols.residential]||'Resident').trim(),cash:n(cols.cash),nonCash:n(cols.nonCash),meals:n(cols.meals),gross:n(cols.gross)||n(cols.cash)+n(cols.nonCash)+n(cols.meals)+n(cols.housing),taxableInput:n(cols.taxable),sourcePAYE,createdAt:new Date().toISOString()};
-      const r=taxRecord(raw); if(hasSelfAssessedColumn){r.paye=sourcePAYE;r.payeSource='Imported iTax value';} r.importedTaxable=raw.taxableInput; db.payroll.push(r);count++;
+    const norm=v=>String(v||'').replace(/^\uFEFF/,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+    const headerAt=rows.slice(0,30).findIndex(row=>{const h=row.map(norm);return h.some(x=>x==='pin'||x.includes('pin of employee'))&&h.some(x=>x==='employee'||x.includes('name of the employee')||x.includes('employee name'));});
+    const hasHeaders=headerAt>=0, headers=hasHeaders?rows[headerAt].map(norm):[];
+    const body=hasHeaders?rows.slice(headerAt+1):rows;const idx=(aliases,fallback=-1)=>{const i=headers.findIndex(h=>aliases.some(a=>h===a||h.includes(a)));return i>=0?i:fallback;};
+    const cols={pin:idx(['pin of employee','employee pin','pin'],0),name:idx(['name of the employee','employee name','employee'],1),residential:idx(['residential status'],2),cash:idx(['total cash pay','cash pay'],4),nonCash:idx(['total non cash pay','non cash pay'],5),meals:idx(['value of meals','meals'],6),housing:idx(['net value of housing','housing'],7),gross:idx(['total gross pay','gross pay'],8),taxable:idx(['taxable pay'],10),taxPayable:idx(['tax payable'],11),monthlyRelief:idx(['monthly relief','personal relief'],-1),paye:idx(['paye tax','paye'],12),selfAssessed:idx(['self assessed paye'],13),nssf:idx(['nssf'],-1),shif:idx(['shif'],-1),ahl:idx(['housing levy','ahl'],-1),month:idx(['payroll month','month'],-1),year:idx(['tax year','year'],-1)};
+    const meta=rows.slice(0,Math.max(0,headerAt)).flat().map(norm);let metaMonth='',metaYear=0;
+    for(let i=0;i<meta.length-1;i++){if(meta[i]==='month'&&MONTHS.some(m=>m.toLowerCase()===meta[i+1]))metaMonth=MONTHS.find(m=>m.toLowerCase()===meta[i+1].toLowerCase());if(meta[i]==='year'&&/^20\d{2}$/.test(meta[i+1]))metaYear=Number(meta[i+1]);}
+    let fallbackMonth=metaMonth||$('#payroll-month').value||activeMonth, fallbackYear=metaYear||Number($('#payroll-year').value||activeYear);
+    if(MONTHS.includes(fallbackMonth))$('#payroll-month').value=fallbackMonth;if($('#payroll-year').querySelector(`option[value="${fallbackYear}"]`))$('#payroll-year').value=fallbackYear;
+    const companyId=$('#payroll-company').value||db.companies[0].id;let count=0,skipped=0;
+    const n=(row,i)=>i<0?0:Number(String(row[i]||'').replace(/[^0-9.-]/g,''))||0;
+    for(const cells of body){const name=String(cells[cols.name]||'').trim();if(!name||/^name of (the )?employee$/i.test(name)){skipped++;continue;}
+      const month=cols.month>=0&&MONTHS.some(m=>m.toLowerCase()===String(cells[cols.month]).trim().toLowerCase())?MONTHS.find(m=>m.toLowerCase()===String(cells[cols.month]).trim().toLowerCase()):fallbackMonth;
+      const year=cols.year>=0&&Number(cells[cols.year])?Number(cells[cols.year]):fallbackYear;
+      const gross=n(cells,cols.gross)||n(cells,cols.cash)+n(cells,cols.nonCash)+n(cells,cols.meals)+n(cells,cols.housing);
+      const raw={companyId,month,year,pin:String(cells[cols.pin]||'').trim(),name,residential:String(cells[cols.residential]||'Resident').trim(),cash:cols.cash>=0?n(cells,cols.cash):gross,nonCash:n(cells,cols.nonCash),meals:n(cells,cols.meals),gross,taxableInput:n(cells,cols.taxable),sourceTaxCharged:n(cells,cols.taxPayable),sourceRelief:n(cells,cols.monthlyRelief),sourcePAYE:n(cells,cols.paye>=0?cols.paye:cols.selfAssessed),createdAt:new Date().toISOString()};
+      const r=taxRecord(raw);if(cols.paye>=0||cols.selfAssessed>=0){r.paye=raw.sourcePAYE;r.payeSource='Imported iTax value';}if(cols.nssf>=0)r.nssf=n(cells,cols.nssf);if(cols.shif>=0)r.shif=n(cells,cols.shif);if(cols.ahl>=0)r.ahl=n(cells,cols.ahl);r.importedTaxable=raw.taxableInput;r.importedTaxCharged=raw.sourceTaxCharged;r.importedRelief=raw.sourceRelief;db.payroll.push(r);count++;
     }
-    addActivity(`Imported ${count} payroll record${count===1?'':'s'} · ${month} ${year}`,'payroll');save();toast(`${count} payroll records imported.`);$('#payroll-file').value='';
+    if(!count){toast(`No payroll rows imported. Check the employee-name, PIN, and payroll columns in ${file.name}.`);$('#payroll-file').value='';return;}
+    addActivity(`Imported ${count} payroll record${count===1?'':'s'} · ${fallbackMonth} ${fallbackYear}`,'payroll');save();toast(`${count} payroll records imported${skipped?` · ${skipped} rows skipped`:''}.`);$('#payroll-file').value='';
   }
   async function importVat(file) {
     if(!db.companies.length){toast('Add a company before importing VAT invoices.');showView('companies');return;}
     const rows=parseCsv(await file.text());if(!rows.length){toast('The selected file is empty.');return;}
-    const headers=rows[0].map(x=>x.toLowerCase());const hasHeaders=headers.some(x=>x.includes('invoice')||x.includes('taxable value')||x.includes('pin of'));
-    const body=hasHeaders?rows.slice(1):rows;const idx=(words,fallback)=>{const i=headers.findIndex(h=>words.some(w=>h.includes(w)));return i>=0?i:fallback;};
-    const c={pin:idx(['pin of supplier','pin of purchaser','supplier pin','customer pin'],0),name:idx(['name of supplier','name of purchaser','supplier name','customer name'],1),date:idx(['invoice date','date'],2),no:idx(['invoice number','invoice no'],3),description:idx(['description'],4),taxable:idx(['taxable value'],5),vat:idx(['amount of vat','vat amount'],6),taxType:idx(['tax type'],8),direction:idx(['transaction type','direction','type'],11)};
-    const companyId=$('#vat-company').value||db.companies[0].id;let count=0;
-    const hasDirection=hasHeaders&&headers.some(h=>h.includes('transaction type')||h.includes('direction'));
-    const chosenDirection=$('#vat-type').value==='purchases'?'purchases':'sales';
-    for(const row of body){if(!row[c.date]||!row[c.no])continue;const when=parseInvoiceDate(row[c.date]);if(!when)continue;const dateKey=`${when.getFullYear()}-${String(when.getMonth()+1).padStart(2,'0')}-${String(when.getDate()).padStart(2,'0')}`;const direction=hasDirection?(/purchase|input/i.test(row[c.direction]||'')?'purchases':'sales'):chosenDirection;const taxType=row[c.taxType]||'VAT';const taxable=Number(String(row[c.taxable]||0).replace(/[, ]/g,''))||0;const schedule=vatRate(taxType,dateKey);const amt=Number(String(row[c.vat]||'').replace(/[, ]/g,''))||taxable*schedule.rate;
-      db.invoices.push({id:crypto.randomUUID(),companyId,direction,date:dateKey,month:MONTHS[when.getMonth()],year:when.getFullYear(),pin:row[c.pin]||'',counterparty:row[c.name]||'',invoiceNo:row[c.no],description:row[c.description]||'',taxType,rate:schedule.rate,rateRule:schedule.rule,taxable,vat:amt,total:taxable+amt,createdAt:new Date().toISOString()});count++;
+    const norm=v=>String(v||'').replace(/^\uFEFF/,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+    const headerAt=rows.slice(0,30).findIndex(row=>{const h=row.map(norm);return h.some(x=>x==='invoice date'||x==='date')&&h.some(x=>x.includes('invoice number')||x==='invoice no'||x==='invoice number no')&&h.some(x=>x.includes('taxable value')||x==='taxable');});
+    if(headerAt<0){toast(`Could not find invoice date, invoice number, and taxable value columns in ${file.name}. Export the invoice table to CSV and try again.`);$('#vat-file').value='';return;}
+    const headers=rows[headerAt].map(norm),idx=(aliases)=>headers.findIndex(h=>aliases.some(a=>h===a||h.includes(a)));
+    const c={pin:idx(['pin of supplier','pin of purchaser','supplier pin','customer pin','pin']),name:idx(['name of supplier','name of purchaser','supplier name','customer name','counterparty']),date:idx(['invoice date','date']),no:idx(['invoice number','invoice no']),description:idx(['description']),taxable:idx(['taxable value','taxable']),vat:idx(['amount of vat','vat amount','vat']),taxType:idx(['tax type']),direction:idx(['transaction type','direction','type'])};
+    const body=rows.slice(headerAt+1), preamble=rows.slice(0,headerAt).flat().join(' ');const hasDirection=c.direction>=0;
+    const autoDir=preamble.match(/(?:data for|loaded type)\s*:?\s*(sales|purchase|purchases)/i)?.[1]||'';
+    const selectedDirection=$('#vat-import-direction').value;
+    const chosenDirection=autoDir?(autoDir.toLowerCase().startsWith('purchase')?'purchases':'sales'):selectedDirection;
+    if(!hasDirection&&!chosenDirection){toast('Choose Sales or Purchases in “Import as” when the CSV does not include a transaction type.');$('#vat-file').value='';return;}
+    const companyId=$('#vat-company').value||db.companies[0].id;let count=0,skipped=0,duplicates=0;
+    const n=(v)=>Number(String(v||'').replace(/[^0-9.-]/g,''))||0;
+    const forcedType=$('#vat-import-tax-type').value;
+    for(const row of body){if(!row[c.date]||!row[c.no]){skipped++;continue;}const when=parseInvoiceDate(row[c.date]);if(!when){skipped++;continue;}
+      const dateKey=`${when.getFullYear()}-${String(when.getMonth()+1).padStart(2,'0')}-${String(when.getDate()).padStart(2,'0')}`;
+      const direction=hasDirection?(/purchase|input/i.test(row[c.direction]||'')?'purchases':'sales'):chosenDirection;
+      const taxType=forcedType||row[c.taxType]||'VAT';const schedule=vatRate(taxType,dateKey);const taxable=n(row[c.taxable]);const vatText=String(row[c.vat]??'').trim();const amt=vatText===''?taxable*schedule.rate:n(vatText);
+      const invoiceNo=String(row[c.no]||'').trim();if(db.invoices.some(x=>x.companyId===companyId&&x.direction===direction&&x.invoiceNo===invoiceNo&&x.date===dateKey)){duplicates++;continue;}
+      db.invoices.push({id:crypto.randomUUID(),companyId,direction,date:dateKey,month:MONTHS[when.getMonth()],year:when.getFullYear(),pin:c.pin>=0?row[c.pin]||'':'',counterparty:c.name>=0?row[c.name]||'':'',invoiceNo,description:c.description>=0?row[c.description]||'':'',taxType,rate:schedule.rate,rateRule:schedule.rule,taxable,vat:amt,total:taxable+amt,createdAt:new Date().toISOString()});count++;
     }
-    addActivity(`Imported ${count} VAT invoices`,'vat');save();toast(`${count} VAT invoices imported${hasDirection?'':` as ${chosenDirection}`}.`);$('#vat-file').value='';
+    if(!count){toast(`No new VAT invoices imported. ${duplicates?`${duplicates} duplicate${duplicates===1?' was':'s were'} skipped. `:''}Check invoice dates and invoice numbers in ${file.name}.`);$('#vat-file').value='';return;}
+    addActivity(`Imported ${count} VAT invoices`,'vat');save();toast(`${count} VAT invoices imported${duplicates?` · ${duplicates} duplicates skipped`:''}.`);$('#vat-file').value='';
   }
   function downloadCsv(filename, rows) {
     const csv=rows.map(r=>r.map(v=>`"${String(v??'').replace(/"/g,'""')}"`).join(',')).join('\r\n');const blob=new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=filename;a.click();URL.revokeObjectURL(a.href);
@@ -325,14 +426,30 @@
   $('#modal-close').addEventListener('click',closeModal);$('#modal-cancel').addEventListener('click',closeModal);$('#modal-backdrop').addEventListener('click',e=>{if(e.target.id==='modal-backdrop')closeModal();});
   $('#mobile-menu').addEventListener('click',()=>$('#sidebar').classList.toggle('mobile-open'));
   $('#payroll-file').addEventListener('change',e=>e.target.files[0]&&importPayroll(e.target.files[0]));$('#vat-file').addEventListener('change',e=>e.target.files[0]&&importVat(e.target.files[0]));
-  $('#payroll-export').addEventListener('click',csvPayroll);$('#vat-export').addEventListener('click',csvVat);$('#print-p9').addEventListener('click',()=>window.print());
+  $('#payroll-export').addEventListener('click',csvPayroll);$('#vat-export').addEventListener('click',csvVat);$('#print-p9').addEventListener('click',()=>window.print());$('#print-all-p9').addEventListener('click',printAllP9);
   $$('.auth-tab').forEach(button=>button.addEventListener('click',()=>setAuthMode(button.dataset.authMode)));
   $('#show-password').addEventListener('click',()=>{const input=$('#auth-password'),show=input.type==='password';input.type=show?'text':'password';$('#show-password').textContent=show?'Hide':'Show';});
   $('#forgot-password').addEventListener('click',()=>{$('#auth-error').textContent='Password recovery needs an email service. This local preview cannot reset account passwords.';});
-  $('#logout-button').addEventListener('click',()=>{activeAccount=null;db={...emptyState};sessionStorage.removeItem(SESSION_KEY);localStorage.removeItem(SESSION_KEY);openAuth('signin');});
+  $('#logout-button').addEventListener('click',async()=>{if(cloudReady())await cloudClient.auth.signOut();cloudUserId=null;activeAccount=null;db={...emptyState};sessionStorage.removeItem(SESSION_KEY);localStorage.removeItem(SESSION_KEY);openAuth('signin');});
   $('#auth-form').addEventListener('submit',async e=>{
     e.preventDefault(); const mode=e.currentTarget.dataset.mode, email=$('#auth-email').value.trim().toLowerCase(), password=$('#auth-password').value, error=$('#auth-error'); error.textContent='';
     try {
+      if(cloudReady()) {
+        let user, authError;
+        if(mode==='signup') {
+          const name=$('#auth-name').value.trim(),confirm=$('#auth-confirm').value;
+          if(!name){error.textContent='Enter your name.';return;}
+          if(password.length<8){error.textContent='Use a password with at least 8 characters.';return;}
+          if(password!==confirm){error.textContent='The passwords do not match.';return;}
+          ({data:{user},error:authError}=await cloudClient.auth.signUp({email,password,options:{data:{full_name:name},emailRedirectTo:location.href.split('#')[0]}}));
+          if(authError)throw authError;
+          if(!user||!user.id){error.textContent='Check your email to confirm the new account, then sign in.';return;}
+        } else {
+          ({data:{user},error:authError}=await cloudClient.auth.signInWithPassword({email,password}));
+          if(authError)throw authError;
+        }
+        await loadCloudWorkspace(user);showCloudWorkspace(user);return;
+      }
       if(!crypto.subtle) throw new Error('Password security is unavailable in this browser context. Open CRM through localhost or a secure HTTPS site.');
       let list=accounts();
       if(mode==='signup') {
@@ -355,7 +472,7 @@
   });
   $('#assistant-form').addEventListener('submit',e=>{e.preventDefault();const input=$('#assistant-input'), question=input.value.trim();if(!question)return;appendAssistantMessage(question,'user');input.value='';window.setTimeout(()=>appendAssistantMessage(assistantAnswer(question),'assistant'),180);});
   $$('.assistant-prompts [data-assistant-prompt]').forEach(button=>button.addEventListener('click',()=>{$('#assistant-input').value=button.dataset.assistantPrompt;$('#assistant-form').requestSubmit();}));
-  addPeriodOptions('payroll-month','payroll-year');addPeriodOptions('vat-month','vat-year');addPeriodOptions('p9-year', 'p9-year');
+  addPeriodOptions('payroll-month','payroll-year');addPeriodOptions('vat-month','vat-year');
   // The P9 card has a single year selector; build its options explicitly.
   $('#p9-year').innerHTML=Array.from({length:13},(_,i)=>2023+i).map(y=>`<option>${y}</option>`).join('');$('#p9-year').value=activeYear;
   $('#today-label').textContent=now.toLocaleDateString('en-KE',{weekday:'short',day:'2-digit',month:'short',year:'numeric'});
