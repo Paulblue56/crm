@@ -12,7 +12,7 @@ CRM combines the three workbook workflows in one responsive website:
 
 ## Open the website
 
-Open `index.html` in a modern browser. The app has no build step or package install. It is also a static site and can be hosted on a web server. It uses browser storage until Supabase is configured. For cloud accounts, create a Supabase project, run [`supabase/schema.sql`](supabase/schema.sql) in the SQL Editor, then set the Project URL and publishable/anon key in `supabase-config.js`. Never use a secret/service-role key in the website. Supabase Auth and Row Level Security isolate each account. Existing local records are only uploaded after the user explicitly confirms the migration prompt.
+Open `index.html` in a modern browser. The app has no build step or package install. It is also a static site and can be hosted on a web server. It uses browser storage until Supabase is configured. For cloud accounts, create a Supabase project, run [`supabase/schema-setup.sql`](supabase/schema-setup.sql) in the SQL Editor, then set the Project URL and publishable/anon key in `supabase-config.js`. Never use a secret/service-role key in the website. Supabase Auth and Row Level Security isolate each account. Existing local records are only uploaded after the user explicitly confirms the migration prompt.
 
 Start by adding a company. Then add payroll rows or import a CSV, and the P9 view will use those records. VAT invoices are recorded separately under the same company.
 
