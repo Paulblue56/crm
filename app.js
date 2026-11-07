@@ -341,8 +341,12 @@
   });
 
   function parseCsv(text) {
+    text=String(text||'').replace(/^\uFEFF/,'');
+    const sample=text.split(/\r?\n/).find(line=>line.trim())||'';
+    let delimiter=',',best=-1;
+    for(const candidate of [',',';','\t']){let count=0,quoted=false;for(let i=0;i<sample.length;i++){if(sample[i]==='"'){if(quoted&&sample[i+1]==='"')i++;else quoted=!quoted;}else if(sample[i]===candidate&&!quoted)count++;}if(count>best){best=count;delimiter=candidate;}}
     const rows=[];let row=[],cell='',quoted=false;
-    for(let i=0;i<text.length;i++){const c=text[i];if(quoted){if(c==='"'&&text[i+1]==='"'){cell+='"';i++;}else if(c==='"')quoted=false;else cell+=c;}else if(c==='"')quoted=true;else if(c===','){row.push(cell);cell='';}else if(c==='\n'){row.push(cell.replace(/\r$/,''));if(row.some(v=>v.trim()))rows.push(row);row=[];cell='';}else cell+=c;}
+    for(let i=0;i<text.length;i++){const c=text[i];if(quoted){if(c==='"'&&text[i+1]==='"'){cell+='"';i++;}else if(c==='"')quoted=false;else cell+=c;}else if(c==='"')quoted=true;else if(c===delimiter){row.push(cell);cell='';}else if(c==='\n'){row.push(cell.replace(/\r$/,''));if(row.some(v=>v.trim()))rows.push(row);row=[];cell='';}else cell+=c;}
     if(cell.length||row.length){row.push(cell.replace(/\r$/,''));if(row.some(v=>v.trim()))rows.push(row);}return rows;
   }
   function parseInvoiceDate(value) {
@@ -356,52 +360,57 @@
     const parsed=new Date(raw);
     return Number.isNaN(parsed.getTime())?null:parsed;
   }
-  async function importPayroll(file) {
+  async function importPayroll(file) { return importPayrollText(await file.text(),file.name); }
+  async function importPayrollText(text,fileName='pasted iTax rows') {
     if(!db.companies.length){toast('Add a company before importing payroll.');showView('companies');return;}
-    const rows=parseCsv(await file.text()); if(!rows.length){toast('The selected file is empty.');return;}
+    const rows=parseCsv(text); if(!rows.length){toast('Paste or select a file containing payroll rows.');return;}
     const norm=v=>String(v||'').replace(/^\uFEFF/,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
     const headerAt=rows.slice(0,30).findIndex(row=>{const h=row.map(norm);return h.some(x=>x==='pin'||x.includes('pin of employee'))&&h.some(x=>x==='name'||x==='employee'||x.includes('name of the employee')||x.includes('employee name'));});
     const hasHeaders=headerAt>=0, headers=hasHeaders?rows[headerAt].map(norm):[];
     const body=hasHeaders?rows.slice(headerAt+1):rows;const idx=(aliases,fallback=-1)=>{const i=headers.findIndex(h=>aliases.some(a=>h===a||h.includes(a)));return i>=0?i:fallback;};
-    const cols={pin:idx(['pin of employee','employee pin','pin'],0),name:idx(['name of the employee','employee name','employee','name'],1),residential:idx(['residential status'],2),cash:idx(['total cash pay','cash pay'],4),nonCash:idx(['total non cash pay','non cash pay'],5),meals:idx(['value of meals','meals'],6),housing:idx(['net value of housing','housing'],7),gross:idx(['total gross pay','gross pay'],8),taxable:idx(['taxable pay'],10),taxPayable:idx(['tax payable'],11),monthlyRelief:idx(['monthly relief','personal relief'],-1),paye:idx(['paye tax','paye'],12),selfAssessed:idx(['self assessed paye'],13),nssf:idx(['nssf'],-1),shif:idx(['shif'],-1),ahl:idx(['housing levy','ahl'],-1),month:idx(['payroll month','month'],-1),year:idx(['tax year','year'],-1)};
+    const cols={pin:idx(['pin of employee','employee pin','pin'],0),name:idx(['name of the employee','employee name','employee','name'],1),residential:idx(['residential status'],2),cash:idx(['total cash pay','cash pay'],4),nonCash:idx(['total non cash pay','non cash pay'],5),meals:idx(['value of meals','meals'],6),housing:idx(['net value of housing','housing'],7),gross:idx(['total gross pay','gross pay'],8),taxable:idx(['taxable pay'],10),taxPayable:idx(['tax payable'],11),monthlyRelief:idx(['monthly relief','personal relief'],-1),paye:idx(['paye tax','paye'],12),selfAssessed:idx(['self assessed paye'],13),nssf:idx(['nssf'],-1),shif:idx(['shif'],-1),ahl:idx(['housing levy','ahl'], -1),month:idx(['payroll month','month'],-1),year:idx(['tax year','year'],-1),companyName:idx(['company name','employer name'],-1),companyPin:idx(['company pin','employer pin'],-1)};
     const meta=rows.slice(0,Math.max(0,headerAt)).flat().map(norm);let metaMonth='',metaYear=0;
     for(let i=0;i<meta.length-1;i++){if(meta[i]==='month'&&MONTHS.some(m=>m.toLowerCase()===meta[i+1]))metaMonth=MONTHS.find(m=>m.toLowerCase()===meta[i+1].toLowerCase());if(meta[i]==='year'&&/^20\d{2}$/.test(meta[i+1]))metaYear=Number(meta[i+1]);}
     let fallbackMonth=metaMonth||$('#payroll-month').value||activeMonth, fallbackYear=metaYear||Number($('#payroll-year').value||activeYear);
     if(MONTHS.includes(fallbackMonth))$('#payroll-month').value=fallbackMonth;if($('#payroll-year').querySelector(`option[value="${fallbackYear}"]`))$('#payroll-year').value=fallbackYear;
-    const companyId=$('#payroll-company').value||db.companies[0].id;let count=0,skipped=0;
-    const n=(row,i)=>i<0?0:Number(String(row[i]||'').replace(/[^0-9.-]/g,''))||0;
+    const companyId=$('#payroll-company').value||db.companies[0].id;let count=0,skipped=0,unmatchedCompanies=0;
+    const n=(row,i)=>{if(i<0)return 0;let s=String(row[i]??'').trim().replace(/[^0-9,.-]/g,'');if(s.includes(',')&&s.includes('.'))s=s.lastIndexOf(',')>s.lastIndexOf('.')?s.replace(/\./g,'').replace(',','.'):s.replace(/,/g,'');else if(s.includes(',')){const last=s.split(',').at(-1);s=last.length===3?s.replace(/,/g,''):s.replace(',','.');}return Number(s)||0;};
     for(const cells of body){const name=String(cells[cols.name]||'').trim();if(!name||/^name of (the )?employee$/i.test(name)){skipped++;continue;}
       const month=cols.month>=0&&MONTHS.some(m=>m.toLowerCase()===String(cells[cols.month]).trim().toLowerCase())?MONTHS.find(m=>m.toLowerCase()===String(cells[cols.month]).trim().toLowerCase()):fallbackMonth;
       const year=cols.year>=0&&Number(cells[cols.year])?Number(cells[cols.year]):fallbackYear;
+      const rowCompanyPin=cols.companyPin>=0?String(cells[cols.companyPin]||'').trim().toUpperCase():'';
+      const rowCompanyName=cols.companyName>=0?String(cells[cols.companyName]||'').trim().toLowerCase():'';
+      const rowCompany=db.companies.find(c=>(rowCompanyPin&&String(c.pin||'').trim().toUpperCase()===rowCompanyPin)||(rowCompanyName&&String(c.name||'').trim().toLowerCase()===rowCompanyName));
+      if((rowCompanyPin||rowCompanyName)&&!rowCompany){unmatchedCompanies++;continue;}
       const gross=n(cells,cols.gross)||n(cells,cols.cash)+n(cells,cols.nonCash)+n(cells,cols.meals)+n(cells,cols.housing);
-      const raw={companyId,month,year,pin:String(cells[cols.pin]||'').trim(),name,residential:String(cells[cols.residential]||'Resident').trim(),cash:cols.cash>=0?n(cells,cols.cash):gross,nonCash:n(cells,cols.nonCash),meals:n(cells,cols.meals),gross,taxableInput:n(cells,cols.taxable),sourceTaxCharged:n(cells,cols.taxPayable),sourceRelief:n(cells,cols.monthlyRelief),sourcePAYE:n(cells,cols.paye>=0?cols.paye:cols.selfAssessed),createdAt:new Date().toISOString()};
+      const raw={companyId:rowCompany?.id||companyId,month,year,pin:String(cells[cols.pin]||'').trim(),name,residential:String(cells[cols.residential]||'Resident').trim(),cash:cols.cash>=0?n(cells,cols.cash):gross,nonCash:n(cells,cols.nonCash),meals:n(cells,cols.meals),gross,taxableInput:n(cells,cols.taxable),sourceTaxCharged:n(cells,cols.taxPayable),sourceRelief:n(cells,cols.monthlyRelief),sourcePAYE:n(cells,cols.paye>=0?cols.paye:cols.selfAssessed),createdAt:new Date().toISOString()};
       const r=taxRecord(raw);if(cols.paye>=0||cols.selfAssessed>=0){r.paye=raw.sourcePAYE;r.payeSource='Imported iTax value';}if(cols.nssf>=0)r.nssf=n(cells,cols.nssf);if(cols.shif>=0)r.shif=n(cells,cols.shif);if(cols.ahl>=0)r.ahl=n(cells,cols.ahl);r.importedTaxable=raw.taxableInput;r.importedTaxCharged=raw.sourceTaxCharged;r.importedRelief=raw.sourceRelief;db.payroll.push(r);count++;
     }
-    if(!count){toast(`No payroll rows imported. Check the employee-name, PIN, and payroll columns in ${file.name}.`);$('#payroll-file').value='';return;}
-    addActivity(`Imported ${count} payroll record${count===1?'':'s'} · ${fallbackMonth} ${fallbackYear}`,'payroll');save();toast(`${count} payroll records imported${skipped?` · ${skipped} rows skipped`:''}.`);$('#payroll-file').value='';
+    if(!count){toast(`No payroll rows imported. Check the employee-name, PIN and payroll columns in ${fileName}${unmatchedCompanies?`; ${unmatchedCompanies} rows used an unknown company`:''}.`);$('#payroll-file').value='';return;}
+    addActivity(`Imported ${count} payroll record${count===1?'':'s'} · ${fallbackMonth} ${fallbackYear}`,'payroll');save();toast(`${count} payroll records imported${skipped?` · ${skipped} rows skipped`:''}${unmatchedCompanies?` · ${unmatchedCompanies} unknown-company rows skipped`:''}.`);$('#payroll-file').value='';if($('#payroll-paste'))$('#payroll-paste').value='';
   }
   async function importVat(file) {
     if(!db.companies.length){toast('Add a company before importing VAT invoices.');showView('companies');return;}
     const rows=parseCsv(await file.text());if(!rows.length){toast('The selected file is empty.');return;}
     const norm=v=>String(v||'').replace(/^\uFEFF/,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
-    const headerAt=rows.slice(0,30).findIndex(row=>{const h=row.map(norm);return h.some(x=>x==='invoice date'||x==='date')&&h.some(x=>x.includes('invoice number')||x==='invoice no'||x==='invoice number no')&&h.some(x=>x.includes('taxable value')||x==='taxable');});
+    const headerAt=rows.slice(0,50).findIndex(row=>{const h=row.map(norm);return h.some(x=>x.includes('date'))&&h.some(x=>x.includes('invoice number')||x==='invoice no'||x==='invoice number no'||x==='invoice reference')&&h.some(x=>x.includes('taxable value')||x.includes('taxable amount')||x==='taxable');});
     if(headerAt<0){toast(`Could not find invoice date, invoice number, and taxable value columns in ${file.name}. Export the invoice table to CSV and try again.`);$('#vat-file').value='';return;}
     const headers=rows[headerAt].map(norm),idx=(aliases)=>headers.findIndex(h=>aliases.some(a=>h===a||h.includes(a)));
-    const c={pin:idx(['pin of supplier','pin of purchaser','supplier pin','customer pin','pin']),name:idx(['name of supplier','name of purchaser','supplier name','customer name','counterparty']),date:idx(['invoice date','date']),no:idx(['invoice number','invoice no']),description:idx(['description']),taxable:idx(['taxable value','taxable']),vat:idx(['amount of vat','vat amount','vat']),taxType:idx(['tax type']),direction:idx(['transaction type','direction','type'])};
+    const c={pin:idx(['pin of supplier','pin of purchaser','supplier pin','customer pin','counterparty pin','pin']),name:idx(['name of supplier','name of purchaser','supplier name','customer name','counterparty']),date:idx(['invoice date','date']),no:idx(['invoice number','invoice no','invoice reference']),description:idx(['description']),taxable:idx(['taxable value','taxable amount','taxable']),vat:idx(['amount of vat','vat amount','vat']),taxType:idx(['tax type']),direction:idx(['transaction type','direction','type'])};
     const body=rows.slice(headerAt+1), preamble=rows.slice(0,headerAt).flat().join(' ');const hasDirection=c.direction>=0;
     const autoDir=preamble.match(/(?:data for|loaded type)\s*:?\s*(sales|purchase|purchases)/i)?.[1]||'';
     const selectedDirection=$('#vat-import-direction').value;
     const chosenDirection=autoDir?(autoDir.toLowerCase().startsWith('purchase')?'purchases':'sales'):selectedDirection;
     if(!hasDirection&&!chosenDirection){toast('Choose Sales or Purchases in “Import as” when the CSV does not include a transaction type.');$('#vat-file').value='';return;}
     const companyId=$('#vat-company').value||db.companies[0].id;let count=0,skipped=0,duplicates=0;
-    const n=(v)=>Number(String(v||'').replace(/[^0-9.-]/g,''))||0;
+    const n=(v)=>{let s=String(v??'').trim().replace(/[^0-9,.-]/g,'');if(s.includes(',')&&s.includes('.'))s=s.lastIndexOf(',')>s.lastIndexOf('.')?s.replace(/\./g,'').replace(',','.'):s.replace(/,/g,'');else if(s.includes(',')){const last=s.split(',').at(-1);s=last.length===3?s.replace(/,/g,''):s.replace(',','.');}return Number(s)||0;};
     const forcedType=$('#vat-import-tax-type').value;
     for(const row of body){if(!row[c.date]||!row[c.no]){skipped++;continue;}const when=parseInvoiceDate(row[c.date]);if(!when){skipped++;continue;}
       const dateKey=`${when.getFullYear()}-${String(when.getMonth()+1).padStart(2,'0')}-${String(when.getDate()).padStart(2,'0')}`;
       const direction=hasDirection?(/purchase|input/i.test(row[c.direction]||'')?'purchases':'sales'):chosenDirection;
       const taxType=forcedType||row[c.taxType]||'VAT';const schedule=vatRate(taxType,dateKey);const taxable=n(row[c.taxable]);const vatText=String(row[c.vat]??'').trim();const amt=vatText===''?taxable*schedule.rate:n(vatText);
-      const invoiceNo=String(row[c.no]||'').trim();if(db.invoices.some(x=>x.companyId===companyId&&x.direction===direction&&x.invoiceNo===invoiceNo&&x.date===dateKey)){duplicates++;continue;}
-      db.invoices.push({id:crypto.randomUUID(),companyId,direction,date:dateKey,month:MONTHS[when.getMonth()],year:when.getFullYear(),pin:c.pin>=0?row[c.pin]||'':'',counterparty:c.name>=0?row[c.name]||'':'',invoiceNo,description:c.description>=0?row[c.description]||'':'',taxType,rate:schedule.rate,rateRule:schedule.rule,taxable,vat:amt,total:taxable+amt,createdAt:new Date().toISOString()});count++;
+      const invoiceNo=String(row[c.no]||'').trim(),pin=c.pin>=0?String(row[c.pin]||'').trim():'';if(db.invoices.some(x=>x.companyId===companyId&&x.direction===direction&&x.invoiceNo===invoiceNo&&x.date===dateKey&&(!pin||String(x.pin||'').trim()===pin))){duplicates++;continue;}
+      db.invoices.push({id:crypto.randomUUID(),companyId,direction,date:dateKey,month:MONTHS[when.getMonth()],year:when.getFullYear(),pin,counterparty:c.name>=0?row[c.name]||'':'',invoiceNo,description:c.description>=0?row[c.description]||'':'',taxType,rate:schedule.rate,rateRule:schedule.rule,taxable,vat:amt,total:taxable+amt,createdAt:new Date().toISOString()});count++;
     }
     if(!count){toast(`No new VAT invoices imported. ${duplicates?`${duplicates} duplicate${duplicates===1?' was':'s were'} skipped. `:''}Check invoice dates and invoice numbers in ${file.name}.`);$('#vat-file').value='';return;}
     addActivity(`Imported ${count} VAT invoices`,'vat');save();toast(`${count} VAT invoices imported${duplicates?` · ${duplicates} duplicates skipped`:''}.`);$('#vat-file').value='';
@@ -426,6 +435,7 @@
   $('#modal-close').addEventListener('click',closeModal);$('#modal-cancel').addEventListener('click',closeModal);$('#modal-backdrop').addEventListener('click',e=>{if(e.target.id==='modal-backdrop')closeModal();});
   $('#mobile-menu').addEventListener('click',()=>$('#sidebar').classList.toggle('mobile-open'));
   $('#payroll-file').addEventListener('change',e=>e.target.files[0]&&importPayroll(e.target.files[0]));$('#vat-file').addEventListener('change',e=>e.target.files[0]&&importVat(e.target.files[0]));
+  $('#payroll-paste-import').addEventListener('click',()=>importPayrollText($('#payroll-paste').value));
   $('#payroll-export').addEventListener('click',csvPayroll);$('#vat-export').addEventListener('click',csvVat);$('#print-p9').addEventListener('click',()=>window.print());$('#print-all-p9').addEventListener('click',printAllP9);
   $$('.auth-tab').forEach(button=>button.addEventListener('click',()=>setAuthMode(button.dataset.authMode)));
   $('#show-password').addEventListener('click',()=>{const input=$('#auth-password'),show=input.type==='password';input.type=show?'text':'password';$('#show-password').textContent=show?'Hide':'Show';});
@@ -435,15 +445,15 @@
     e.preventDefault(); const mode=e.currentTarget.dataset.mode, email=$('#auth-email').value.trim().toLowerCase(), password=$('#auth-password').value, error=$('#auth-error'); error.textContent='';
     try {
       if(cloudReady()) {
-        let user, authError;
+        let user, session, authError;
         if(mode==='signup') {
           const name=$('#auth-name').value.trim(),confirm=$('#auth-confirm').value;
           if(!name){error.textContent='Enter your name.';return;}
           if(password.length<8){error.textContent='Use a password with at least 8 characters.';return;}
           if(password!==confirm){error.textContent='The passwords do not match.';return;}
-          ({data:{user},error:authError}=await cloudClient.auth.signUp({email,password,options:{data:{full_name:name},emailRedirectTo:location.href.split('#')[0]}}));
+          ({data:{user,session},error:authError}=await cloudClient.auth.signUp({email,password,options:{data:{full_name:name},emailRedirectTo:location.href.split('#')[0]}}));
           if(authError)throw authError;
-          if(!user||!user.id){error.textContent='Check your email to confirm the new account, then sign in.';return;}
+          if(!user||!user.id||!session){error.textContent='Check your email to confirm the new account, then sign in.';return;}
         } else {
           ({data:{user},error:authError}=await cloudClient.auth.signInWithPassword({email,password}));
           if(authError)throw authError;

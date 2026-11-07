@@ -2,7 +2,7 @@
 
 CRM combines the three workbook workflows in one responsive website:
 
-- **Payroll:** record a payroll row or import a CSV using the iTax column order. Review statutory deductions, PAYE and employer costs by company and month. Export the selected period to CSV.
+- **Payroll:** record a payroll row, import an iTax CSV, or paste rows copied from the workbook’s iTax Import Form or P9 Input Form. Review statutory deductions, PAYE and employer costs by company and month. Export the selected period to CSV.
 - **P9 forms:** use the KRA-style P9A layout for each employee. Print one employee or create a combined, one-card-per-page company/year PDF.
 - **VAT analysis:** record sales and purchases, import the workbook's CSV layout, choose a transaction direction and import-wide tax type (standard VAT, fuel, zero-rated, or exempt), calculate VAT using invoice dates, and export a period to CSV.
 - **Companies and tax rules:** keep employer details in one list and inspect the effective-dated schedules used in calculations.
