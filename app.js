@@ -436,6 +436,7 @@
   $('#mobile-menu').addEventListener('click',()=>$('#sidebar').classList.toggle('mobile-open'));
   $('#payroll-file').addEventListener('change',e=>e.target.files[0]&&importPayroll(e.target.files[0]));$('#vat-file').addEventListener('change',e=>e.target.files[0]&&importVat(e.target.files[0]));
   $('#payroll-paste-import').addEventListener('click',()=>importPayrollText($('#payroll-paste').value));
+  $('#p9-paste-import').addEventListener('click',()=>{if($('#p9-company').value)$('#payroll-company').value=$('#p9-company').value;if($('#p9-year').value)$('#payroll-year').value=$('#p9-year').value;if($('#p9-paste-month').value)$('#payroll-month').value=$('#p9-paste-month').value;importPayrollText($('#p9-payroll-paste').value);});
   $('#payroll-export').addEventListener('click',csvPayroll);$('#vat-export').addEventListener('click',csvVat);$('#print-p9').addEventListener('click',()=>window.print());$('#print-all-p9').addEventListener('click',printAllP9);
   $$('.auth-tab').forEach(button=>button.addEventListener('click',()=>setAuthMode(button.dataset.authMode)));
   $('#show-password').addEventListener('click',()=>{const input=$('#auth-password'),show=input.type==='password';input.type=show?'text':'password';$('#show-password').textContent=show?'Hide':'Show';});
@@ -483,6 +484,7 @@
   $('#assistant-form').addEventListener('submit',e=>{e.preventDefault();const input=$('#assistant-input'), question=input.value.trim();if(!question)return;appendAssistantMessage(question,'user');input.value='';window.setTimeout(()=>appendAssistantMessage(assistantAnswer(question),'assistant'),180);});
   $$('.assistant-prompts [data-assistant-prompt]').forEach(button=>button.addEventListener('click',()=>{$('#assistant-input').value=button.dataset.assistantPrompt;$('#assistant-form').requestSubmit();}));
   addPeriodOptions('payroll-month','payroll-year');addPeriodOptions('vat-month','vat-year');
+  $('#p9-paste-month').innerHTML=MONTHS.map(m=>`<option value="${m}">${m}</option>`).join('');$('#p9-paste-month').value=activeMonth;
   // The P9 card has a single year selector; build its options explicitly.
   $('#p9-year').innerHTML=Array.from({length:13},(_,i)=>2023+i).map(y=>`<option>${y}</option>`).join('');$('#p9-year').value=activeYear;
   $('#today-label').textContent=now.toLocaleDateString('en-KE',{weekday:'short',day:'2-digit',month:'short',year:'numeric'});
